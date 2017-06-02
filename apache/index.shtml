@@ -1,0 +1,7 @@
+<html>
+	<head><title>HTTPS!!!</title></head>
+	<body>
+		<h1>HTTPS!!!</h1>
+		user is: <!--#echo var="SSL_SRP_USER" -->
+	</body>
+</html>

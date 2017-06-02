@@ -1,0 +1,330 @@
+diff -Naur stunnel-5.41/src/common.h stunnel-5.41-srp/src/common.h
+--- stunnel-5.41/src/common.h	2017-01-02 14:27:26.000000000 +0000
++++ stunnel-5.41-srp/src/common.h	2017-06-01 14:37:23.735926263 +0100
+@@ -39,6 +39,10 @@
+ #define COMMON_H
+ 
+ #include "version.h"
++#include <stdbool.h>
++
++#define CHECK(e) ((e)?(void)(0):onError(#e,__FILE__,__LINE__,true))
++void onError(const char *s, const char *file, int line, bool doabort);
+ 
+ /**************************************** common constants */
+ 
+@@ -446,6 +450,7 @@
+ #if OPENSSL_VERSION_NUMBER<0x10001000L || defined(OPENSSL_NO_TLS1)
+ #define OPENSSL_NO_TLS1_1
+ #define OPENSSL_NO_TLS1_2
++#define OPENSSL_NO_SRP
+ #endif /* OpenSSL older than 1.0.1 || defined(OPENSSL_NO_TLS1) */
+ 
+ #if OPENSSL_VERSION_NUMBER>=0x10100000L
+@@ -488,6 +493,9 @@
+ /* not defined in public headers before OpenSSL 0.9.8 */
+ STACK_OF(SSL_COMP) *SSL_COMP_get_compression_methods(void);
+ #endif /* !defined(OPENSSL_NO_COMP) */
++#ifndef OPENSSL_NO_SRP
++#include <openssl/srp.h>
++#endif /* !defined(OPENSSL_NO_SRP) */
+ 
+ #ifndef OPENSSL_VERSION
+ #define OPENSSL_VERSION SSLEAY_VERSION
+diff -Naur stunnel-5.41/src/ctx.c stunnel-5.41-srp/src/ctx.c
+--- stunnel-5.41/src/ctx.c	2017-03-26 21:25:00.000000000 +0100
++++ stunnel-5.41-srp/src/ctx.c	2017-06-01 14:59:16.172343166 +0100
+@@ -40,6 +40,8 @@
+ 
+ SERVICE_OPTIONS *current_section=NULL;
+ 
++static const int SSL_OK = 1;
++
+ /* try an empty passphrase first */
+ static char cached_passwd[PEM_BUFSIZE]="";
+ static int cached_len=0;
+@@ -77,6 +79,10 @@
+ NOEXPORT unsigned psk_server_callback(SSL *, const char *,
+     unsigned char *, unsigned);
+ #endif /* !defined(OPENSSL_NO_PSK) */
++#ifndef OPENSSL_NO_SRP
++NOEXPORT char *srp_client_callback(SSL *, void *);
++NOEXPORT int srp_server_callback(SSL *, int *, void *);
++#endif /* !defined(OPENSSL_NO_SRP) */
+ NOEXPORT int load_cert_file(SERVICE_OPTIONS *);
+ NOEXPORT int load_key_file(SERVICE_OPTIONS *);
+ NOEXPORT int pkcs12_extension(const char *);
+@@ -476,6 +482,22 @@
+     }
+ #endif /* !defined(OPENSSL_NO_PSK) */
+ 
++#ifndef OPENSSL_NO_SRP
++	if(section->option.client) {
++		if(section->srp_user && section->srp_pass) {
++			CHECK(SSL_CTX_set_srp_username(section->ctx, section->srp_user));
++			CHECK(SSL_CTX_set_srp_password(section->ctx, section->srp_pass));
++//			SSL_CTX_set_srp_cb_arg(section->ctx, section->srp_creds->username);
++//            SSL_CTX_set_srp_client_pwd_callback(section->ctx, srp_client_callback);
++		}
++	} else {
++		if(section->srp_creds) {
++			SSL_CTX_set_srp_cb_arg(section->ctx, section->srp_creds);
++			SSL_CTX_set_srp_username_callback(section->ctx, srp_server_callback);
++		}
++    }
++#endif /* !defined(OPENSSL_NO_SRP) */
++
+     /* initialize the client cert engine */
+ #if !defined(OPENSSL_NO_ENGINE) && OPENSSL_VERSION_NUMBER>=0x0090809fL
+     /* SSL_CTX_set_client_cert_engine() was introduced in OpenSSL 0.9.8i */
+@@ -631,6 +653,49 @@
+ 
+ #endif /* !defined(OPENSSL_NO_PSK) */
+ 
++#ifndef OPENSSL_NO_SRP
++
++// srp_client_callback returns the password for the user
++// not uses obsolete getpass() function
++// hardcoded above to set the pass directly and not call this callback at present
++NOEXPORT char *srp_client_callback(SSL *ssl, void *arg) {
++	(void)ssl;
++	char *user = (char*)arg;
++	
++	ssize_t promptsize = 256;
++	char prompt[promptsize];
++	CHECK(snprintf(prompt, (size_t)promptsize,
++				   "Password for %s: ", user) < promptsize);
++	char *pass = getpass(prompt);
++	char *result = OPENSSL_strdup(pass);
++	// getpass uses a static buffer, so clear it out after use.
++	memset(pass,0,strlen(pass));
++	return result;
++
++}
++
++// srp_server_callback sets the user params
++// need to create/init the SRP_VBASE
++NOEXPORT int srp_server_callback(SSL *ssl, int *ad, void *arg) {
++	(void)ad;
++	SRP_VBASE *srp_creds = (SRP_VBASE *)arg;
++	char *srpusername = SSL_get_srp_username(ssl);
++	CHECK(srpusername != NULL);
++	// Get data for user
++	SRP_user_pwd *p = SRP_VBASE_get_by_user(srp_creds,srpusername);
++	if (p == NULL) {
++		fprintf(stderr, "User %s doesn't exist\n", srpusername);
++		return SSL3_AL_FATAL;
++	}
++	// Set verifier data
++	CHECK(SSL_set_srp_server_param(ssl, p->N, p->g,
++								   p->s, p->v, NULL) == SSL_OK);
++	return SSL_ERROR_NONE;
++
++}
++
++#endif /* !defined(OPENSSL_NO_SRP) */
++
+ NOEXPORT int pkcs12_extension(const char *filename) {
+     const char *ext=strrchr(filename, '.');
+     return ext && (!strcasecmp(ext, ".p12") || !strcasecmp(ext, ".pfx"));
+@@ -1257,4 +1322,15 @@
+     str_free(error_string);
+ }
+ 
++void onError(const char *s, const char *file, int line, bool doabort)
++{
++	fprintf(stderr,"'%s' failed: %s:%d\n", s, file, line);
++	ERR_print_errors_fp(stderr);
++	if (doabort) {
++		fprintf(stderr,"Aborting...\n");
++		abort();
++	}
++}
++
++
+ /* end of ctx.c */
+diff -Naur stunnel-5.41/src/options.c stunnel-5.41-srp/src/options.c
+--- stunnel-5.41/src/options.c	2017-03-28 15:04:38.000000000 +0100
++++ stunnel-5.41-srp/src/options.c	2017-05-31 16:55:22.605837599 +0100
+@@ -78,6 +78,11 @@
+ NOEXPORT void psk_free(PSK_KEYS *);
+ #endif /* !defined(OPENSSL_NO_PSK) */
+ 
++#ifndef OPENSSL_NO_SRP
++//NOEXPORT PSK_KEYS *psk_read(char *);
++//NOEXPORT void psk_free(PSK_KEYS *);
++#endif /* !defined(OPENSSL_NO_SRP) */
++
+ typedef struct {
+     char *name;
+     long unsigned value;
+@@ -1256,6 +1261,10 @@
+         if(section->psk_keys)
+             break;
+ #endif /* !defined(OPENSSL_NO_PSK) */
++#ifndef OPENSSL_NO_SRP
++        if(section->srp_creds)
++            break;
++#endif /* !defined(OPENSSL_NO_SRP) */
+ #ifndef OPENSSL_NO_ENGINE
+         if(section->engine)
+             break;
+@@ -2248,6 +2257,107 @@
+ 
+ #endif /* !defined(OPENSSL_NO_PSK) */
+ 
++#ifndef OPENSSL_NO_SRP
++
++    /* SRPUser */
++    switch(cmd) {
++    case CMD_BEGIN:
++		section->srp_user=NULL;
++        break;
++    case CMD_EXEC:
++		
++        if(strcasecmp(opt, "SRPUser"))
++            break;
++        section->srp_user=str_dup(arg);
++        return NULL; /* OK */
++    case CMD_END:
++        if(!section->srp_user) /* SRP user not configured */
++            break;
++		if(!(section->option.client)) {
++			s_log(LOG_NOTICE,
++				  "SRP user is ignored in the server mode");
++			break;
++		}
++		if(!section->srp_pass)
++			return "No password found for SRP user";
++		
++        break;
++    case CMD_FREE:
++        break;
++    case CMD_DEFAULT:
++        break;
++    case CMD_HELP:
++        s_log(LOG_NOTICE, "%-22s = username for SRP authentication",
++			  "SRPUser");
++        break;
++    }
++
++    /* SRPPass */
++    switch(cmd) {
++    case CMD_BEGIN:
++		section->srp_pass=NULL;
++        break;
++    case CMD_EXEC:
++		
++        if(strcasecmp(opt, "SRPPass"))
++            break;
++        section->srp_pass=str_dup(arg);
++        return NULL; /* OK */
++    case CMD_END:
++        if(!section->srp_pass) /* SRP pass not configured */
++            break;
++		if(!(section->option.client)) {
++			s_log(LOG_NOTICE,
++				  "SRP password is ignored in the server mode");
++			break;
++		}
++		if(!section->srp_user)
++			return "No username found for SRP password";
++			
++        break;
++    case CMD_FREE:
++        break;
++    case CMD_DEFAULT:
++        break;
++    case CMD_HELP:
++        s_log(LOG_NOTICE, "%-22s = password for SRP authentication",
++			  "SRPPass");
++        break;
++    }
++
++    /* SRPVerifier */
++    switch(cmd) {
++    case CMD_BEGIN:
++        section->srp_creds=NULL;
++        break;
++    case CMD_EXEC:
++        if(strcasecmp(opt, "SRPVerifier"))
++            break;
++		section->srp_creds=SRP_VBASE_new(NULL);
++		CHECK(section->srp_creds != NULL);
++		if(SRP_VBASE_init(section->srp_creds, arg) != 0)
++			return "Failed to read SRP verifier file";
++        return NULL; /* OK */
++    case CMD_END:
++		if(section->option.client)
++			s_log(LOG_NOTICE,
++				  "SRP verifier is ignored in the client mode");
++        break;
++    case CMD_FREE:
++		if (section->srp_creds != NULL)
++			SRP_VBASE_free(section->srp_creds);
++        break;
++    case CMD_DEFAULT:
++        break;
++    case CMD_HELP:
++        s_log(LOG_NOTICE, "%-22s = verifier for SRP authentication",
++			  "SRPVerifier");
++        break;
++    }
++
++	#endif /* !defined(OPENSSL_NO_SRP) */
++	
++	
+     /* pty */
+ #ifndef USE_WIN32
+     switch(cmd) {
+diff -Naur stunnel-5.41/src/prototypes.h stunnel-5.41-srp/src/prototypes.h
+--- stunnel-5.41/src/prototypes.h	2017-03-26 21:25:00.000000000 +0100
++++ stunnel-5.41-srp/src/prototypes.h	2017-05-31 17:09:34.314098461 +0100
+@@ -230,6 +230,11 @@
+     PSK_KEYS *psk_keys, *psk_selected;
+     PSK_TABLE psk_sorted;
+ #endif /* !defined(OPENSSL_NO_PSK) */
++#ifndef OPENSSL_NO_SRP
++    char *srp_user;
++	char *srp_pass;
++	SRP_VBASE *srp_creds;
++#endif /* !defined(OPENSSL_NO_SRP) */
+ #ifndef OPENSSL_NO_ECDH
+     int curve;
+ #endif /* !defined(OPENSSL_NO_ECDH) */
+diff -Naur stunnel-5.41/src/stunnel.c stunnel-5.41-srp/src/stunnel.c
+--- stunnel-5.41/src/stunnel.c	2017-03-19 22:36:20.000000000 +0000
++++ stunnel-5.41-srp/src/stunnel.c	2017-05-31 17:14:12.280049650 +0100
+@@ -861,6 +861,14 @@
+ #endif
+         "PSK"
+ #endif /* !defined(OPENSSL_NO_PSK) */
++#ifndef OPENSSL_NO_SRP
++#ifdef TLS_FEATURE_FOUND
++        ","
++#else
++#define TLS_FEATURE_FOUND
++#endif
++        "SRP"
++#endif /* !defined(OPENSSL_NO_SRP) */
+ #ifndef OPENSSL_NO_TLSEXT
+ #ifdef TLS_FEATURE_FOUND
+         ","
+diff -Naur stunnel-5.41/src/verify.c stunnel-5.41-srp/src/verify.c
+--- stunnel-5.41/src/verify.c	2017-03-26 21:25:00.000000000 +0100
++++ stunnel-5.41-srp/src/verify.c	2017-05-31 17:12:43.480276566 +0100
+@@ -171,6 +171,15 @@
+     if(section->psk_keys)
+         return;
+ #endif /* !defined(OPENSSL_NO_PSK) */
++#ifndef OPENSSL_NO_SRP
++	if(section->option.client) {
++		if(section->srp_user && section->srp_pass)
++			return;
++	} else {
++		if(section->srp_creds)
++			return;
++	}
++#endif /* !defined(OPENSSL_NO_SRP) */
+     /* for servers it is usually okay to accept all client
+        certificates signed by a specified certificate authority */
+     if(!section->option.client)
